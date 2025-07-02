@@ -1,25 +1,64 @@
 import os
+import uuid
 from typing import List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from langchain.chains import RetrievalQA
-from langchain_pinecone import PineconeVectorStore
-from langchain_upstage import ChatUpstage
-from langchain_upstage import UpstageEmbeddings
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from pinecone import Pinecone, ServerlessSpec
 from pydantic import BaseModel
 
+# --- LangChain 관련 모듈 ---
+from langchain_upstage import ChatUpstage, UpstageEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.documents import Document
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from pinecone import Pinecone, ServerlessSpec
+
+# --- .env 파일에서 환경 변수 로드 ---
 load_dotenv()
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            """
+# --- 1. 전역 객체 및 기록 저장소 설정 ---
+
+llm = ChatUpstage(streaming=True)
+embeddings = UpstageEmbeddings(model="solar-embedding-1-large")
+pinecone_api_key = os.environ.get("PINECONE_API_KEY")
+pc = Pinecone(api_key=pinecone_api_key)
+index_name = "cards"
+
+if index_name not in pc.list_indexes().names():
+    pc.create_index(name=index_name, dimension=4096, metric="cosine", spec=ServerlessSpec(cloud="aws", region="us-east-1"))
+
+vectorstore = PineconeVectorStore(index=pc.Index(index_name), embedding=embeddings)
+retriever = vectorstore.as_retriever(search_type='mmr', search_kwargs={"k": 5})
+
+chat_histories = {}
+
+# [수정 확인] 함수 인자가 session_id 인지 확인
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    """session_id를 기반으로 대화 기록을 가져오거나 새로 생성합니다."""
+    if session_id not in chat_histories:
+        chat_histories[session_id] = ChatMessageHistory()
+    return chat_histories[session_id]
+
+
+# --- 2. 대화형 RAG 체인 구성 ---
+
+contextualize_q_system_prompt = """
+Given a chat history and the latest user question which might reference context in the chat history, 
+formulate a standalone question which can be understood without the chat history. 
+Do NOT answer the question, just reformulate it if needed and otherwise return it as is.
+"""
+contextualize_q_prompt = ChatPromptTemplate.from_messages([("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")])
+history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
+
+qa_system_prompt = """
             너는 신용카드 추천 전문가야.
             아래 규칙을 반드시 지켜:
             - 신용카드 추천과 관련되지 않은 내용은 절대 언급하지 마.
@@ -60,164 +99,62 @@ prompt = ChatPromptTemplate.from_messages(
 
             context는 다음과 같아:
             {context}
-            """,
-        ),
-        ("human", "{input}")
-    ]
-)
+"""
+qa_prompt = ChatPromptTemplate.from_messages([("system", qa_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")])
 
-# upstage models
-chat_upstage = ChatUpstage()
-embedding_upstage = UpstageEmbeddings(model="embedding-query")
-
-pinecone_api_key = os.environ.get("PINECONE_API_KEY")
-pc = Pinecone(api_key=pinecone_api_key)
-index_name = "cards"
-
-# create new index
-if index_name not in pc.list_indexes().names():
-    pc.create_index(
-        name=index_name,
-        dimension=4096,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-    )
-
-pinecone_vectorstore = PineconeVectorStore(index=pc.Index(index_name), embedding=embedding_upstage)
-
-pinecone_retriever = pinecone_vectorstore.as_retriever(
-    search_type='mmr',  # default : similarity(유사도) / mmr 알고리즘
-    search_kwargs={"k": 5}  # 쿼리와 관련된 chunk를 3개 검색하기 (default : 4)
-)
-
-def search_and_show(query, vectorstore, k=3):
-    results = vectorstore.similarity_search(query, k=k)
-
-    card_seen = set()
-    for doc in results:
-        card_name = doc.metadata["card_name"]
-        if card_name in card_seen:
-            continue  # 같은 카드 이름은 한 번만 출력
-        card_seen.add(card_name)
-
-        print(f"카드 이름: {card_name}")
-        print(f"카드사: {doc.metadata['card_corp']}")
-        print(f"내용 (앞 300자): {doc.metadata['card_full_data'][:300]}...")
-        print("---")
-
-
-# [4] LLM & Prompt 구성 (Upstage LLM)
-#llm = ChatUpstage()
-llm = ChatUpstage(temperature=0)
-
-chain = prompt | llm | StrOutputParser()
-
-def build_context_from_metadata(results):
-    """retriever 결과에서 카드 단위로 card_full_data 기반 context 생성"""
+def format_docs_and_build_context(docs: List[Document]) -> str:
     card_contexts = {}
-    for doc in results:
-        card_name = doc.metadata["card_name"]
-        if card_name not in card_contexts:
-            card_contexts[card_name] = doc.metadata["card_full_data"]
+    for doc in docs:
+        card_name = doc.metadata.get("card_name")
+        if card_name and card_name not in card_contexts:
+            card_data = doc.metadata.get("card_full_data", doc.page_content)
+            card_contexts[card_name] = card_data
+    return "\n\n".join(f"=== {card_name} ===\n{card_data}" for card_name, card_data in card_contexts.items())
 
-    # 카드별 card_full_data를 하나씩 context에 추가
-    context = "\n\n".join(
-        f"=== {card_name} ===\n{card_data}"
-        for card_name, card_data in card_contexts.items()
-    )
-    return context
+Youtube_chain = create_stuff_documents_chain(llm, qa_prompt)
+conversational_rag_chain = create_retrieval_chain(history_aware_retriever, Youtube_chain)
 
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+chain_with_history = RunnableWithMessageHistory(
+    conversational_rag_chain,
+    get_session_history,
+    input_messages_key="input",
+    history_messages_key="chat_history",
+    output_messages_key="answer",
 )
 
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
+# --- 3. FastAPI 애플리케이션 정의 ---
 
+app = FastAPI(title="Card Recommendation Chatbot")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-class AssistantRequest(BaseModel):
+# [수정 확인] 요청 Body 모델
+class ChatEndpointRequest(BaseModel):
     message: str
-    thread_id: Optional[str] = None
+    session_id: Optional[str] = None
 
+# [수정 확인] 스트리밍 제너레이터 함수
+async def stream_generator(query: str, session_id: str):
+    # [수정 확인] config에 'session_id' 전달
+    config = {"configurable": {"session_id": session_id}}
+    async for chunk in chain_with_history.astream({"input": query}, config=config):
+        if "answer" in chunk:
+            yield chunk["answer"]
 
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage]  # Entire conversation for naive mode
-
-
-class MessageRequest(BaseModel):
-    message: str
-
-
+# [수정 확인] FastAPI 엔드포인트
 @app.post("/chat")
-async def chat_endpoint(req: MessageRequest):
-    # 🔍 질의 & 응답 실행
-    query = req.message
-    print("[질문]\n",query)
-    results = pinecone_retriever.invoke(query)
-    print("[카드 종류]\n",results)
-    # metadata 기반 context 생성
-    context = build_context_from_metadata(results)
+async def chat_endpoint(req: ChatEndpointRequest):
+    session_id = req.session_id or str(uuid.uuid4())
+    print(f"[요청] session_id: {session_id}, message: {req.message}")
+    
+    response = StreamingResponse(stream_generator(req.message, session_id), media_type="text/event-stream")
+    response.headers["X-Session-ID"] = session_id
+    return response
 
-    #print("[context]\n", context, "...")  # 너무 길면 앞 1000자만 출력
-
-    # LLM 호출
-    answer = chain.invoke({"context": context, "input": query})
-
-    print("[최종 답변]\n", answer)
-    return {"reply": answer}
-
-
-# @app.post("/assistant")
-# async def assistant_endpoint(req: AssistantRequest):
-#     assistant = await openai.beta.assistants.retrieve("asst_tc4AhtsAjNJnRtpJmy1gjJOE")
-#
-#     if req.thread_id:
-#         # We have an existing thread, append user message
-#         await openai.beta.threads.messages.create(
-#             thread_id=req.thread_id, role="user", content=req.message
-#         )
-#         thread_id = req.thread_id
-#     else:
-#         # Create a new thread with user message
-#         thread = await openai.beta.threads.create(
-#             messages=[{"role": "user", "content": req.message}]
-#         )
-#         thread_id = thread.id
-#
-#     # Run and wait until complete
-#     await openai.beta.threads.runs.create_and_poll(
-#         thread_id=thread_id, assistant_id=assistant.id
-#     )
-#
-#     # Now retrieve messages for this thread
-#     # messages.list returns an async iterator, so let's gather them into a list
-#     all_messages = [
-#         m async for m in openai.beta.threads.messages.list(thread_id=thread_id)
-#     ]
-#     print(all_messages)
-#
-#     # The assistant's reply should be the last message with role=assistant
-#     assistant_reply = all_messages[0].content[0].text.value
-#
-#     return {"reply": assistant_reply, "thread_id": thread_id}
-
-
-@app.get("/health")
 @app.get("/")
 async def health_check():
     return {"status": "ok"}
 
-
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
