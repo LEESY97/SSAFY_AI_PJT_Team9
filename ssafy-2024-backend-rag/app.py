@@ -1,8 +1,10 @@
+# --- Python 모듈 ---
 import os
 import uuid
 import re
 from typing import List, Optional
 
+# --- Backend 관련 모듈 ---
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,13 +27,14 @@ from pinecone import Pinecone, ServerlessSpec
 # --- .env 파일에서 환경 변수 로드 ---
 load_dotenv()
 
-# --- 1. 전역 객체 및 기록 저장소 설정 ---
 
-# 1-1. llm_rag, embeddings 세팅
+# ---[1] 전역 객체 및 기록 저장소 설정---
+
+# [1-1] llm_rag, embeddings 세팅
 llm_rag = ChatUpstage(temperature=0)
 embeddings = UpstageEmbeddings(model="solar-embedding-1-large")
 
-# 1-2. Pinecone 클라이언트 및 인덱스 초기화
+# [1-2] Pinecone 클라이언트 및 인덱스 초기화
 pinecone_api_key = os.environ.get("PINECONE_API_KEY")
 pc = Pinecone(api_key=pinecone_api_key)
 index_name = "cards"
@@ -41,27 +44,7 @@ if index_name not in pc.list_indexes().names():
 vectorstore = PineconeVectorStore(index=pc.Index(index_name), embedding=embeddings)
 retriever = vectorstore.as_retriever(search_type='mmr', search_kwargs={"k": 5})
 
-# # 1-3. 카드 이름 데이터 로드
-# # [데이터 로드]
-# with open("all_cards.txt", encoding="utf-8") as f:
-#     raw_text = f.read()
-
-# # [카드 단위 분리]
-# card_blocks = re.split(r"(?=\[카드 이름\])", raw_text)
-# card_blocks = [block.strip() for block in card_blocks if block.strip()]
-
-# # [추가] 전체 카드 이름 목록 미리 생성
-# all_card_names = set()
-# for block in card_blocks:
-#     name_match = re.search(r"\[카드 이름\]\s*(.*)", block)
-#     if name_match:
-#         all_card_names.add(name_match.group(1).strip())
-# # 리스트로 변환하여 사용
-# all_card_names = list(all_card_names)
-# print(all_card_names)
-# print(f"✅ 총 {len(all_card_names)}개의 고유한 카드 이름을 로드했습니다.")
-
-# 1-4. 대화 기록과 제목을 함께 저장하는 저장소
+# [1-3] 대화 기록과 제목을 함께 저장하는 저장소
 chat_sessions = {}
 
 def get_session_data(session_id: str) -> dict:
@@ -73,14 +56,18 @@ def get_session_data(session_id: str) -> dict:
     return chat_sessions[session_id]
 
 
-# --- 2. 대화형 RAG 체인 및 '제목 생성 체인' 구성 ---
+# ---[2] 대화형 RAG 체인 및 '제목 생성 체인' 구성---
 
-# 2-1. History-Aware Retriever 구성
-contextualize_q_system_prompt = """Given a chat history and the latest user question which might reference context in the chat history, formulate a standalone question which can be understood without the chat history. Do NOT answer the question, just reformulate it if needed and otherwise return it as is."""
+# [2-1] History-Aware Retriever 구성
+contextualize_q_system_prompt = """
+    Given a chat history and the latest user question which might reference context in the chat history,
+    formulate a standalone question which can be understood without the chat history.
+    Do NOT answer the question, just reformulate it if needed and otherwise return it as is.
+    """
 contextualize_q_prompt = ChatPromptTemplate.from_messages([("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")])
 history_aware_retriever = create_history_aware_retriever(llm_rag, retriever, contextualize_q_prompt)
 
-# 2-2. 최종 답변 생성을 위한 프롬프트 (기존 프롬프트 사용)
+# [2-2] 최종 답변 생성을 위한 프롬프트 (기존 프롬프트 사용)
 qa_system_prompt = """
             너는 신용카드 추천 전문가야.
             아래 규칙을 반드시 지켜:
@@ -128,7 +115,7 @@ qa_system_prompt = """
 """
 qa_prompt = ChatPromptTemplate.from_messages([("system", qa_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")])
 
-# 2-3. 검색된 문서를 바탕으로 context를 만드는 함수
+# [2-3] 검색된 문서를 바탕으로 context를 만드는 함수
 def format_docs_and_build_context(docs: List[Document]) -> str:
     card_contexts = {}
     for doc in docs:
@@ -138,7 +125,7 @@ def format_docs_and_build_context(docs: List[Document]) -> str:
             card_contexts[card_name] = card_data
     return "\n\n".join(f"=== {card_name} ===\n{card_data}" for card_name, card_data in card_contexts.items())
 
-# 2-4. 최종적인 문서 생성 및 답변 체인 
+# [2-4] 최종적인 문서 생성 및 답변 체인 
 final_answer_chain = qa_prompt | llm_rag | StrOutputParser()
 
 conversational_rag_chain_produces_string = (
@@ -152,7 +139,8 @@ conversational_rag_chain = RunnablePassthrough.assign(
     answer=conversational_rag_chain_produces_string
 )
 
-# 2-5. 대화 내용 요약(제목 생성)을 위한 별도의 체인
+# [2-5] 대화 내용 요약(제목 생성)을 위한 별도의 체인
+# [2-5-A] 제목 생성을 위한 1단계: '핵심 토픽' 추출 체인
 llm_title = ChatUpstage(temperature=0.3)
 topic_extraction_prompt = ChatPromptTemplate.from_template(
     """다음 사용자 질문에서 가장 핵심적인 요구사항이나 키워드를 명사형으로 추출해줘. 
@@ -163,7 +151,7 @@ topic_extraction_prompt = ChatPromptTemplate.from_template(
 )
 topic_extraction_chain = topic_extraction_prompt | llm_title | StrOutputParser()
 
-# [핵심 수정] 2-B. 제목 생성을 위한 2단계: '최종 제목' 생성 체인
+# [2-5-B] 제목 생성을 위한 2단계: '최종 제목' 생성 체인
 final_title_prompt = ChatPromptTemplate.from_template(
     """다음 키워드를 바탕으로, 대화방의 간결한 제목을 'OOO 카드 추천' 또는 'OOO 문의'와 같은 형태로 하나만 만들어줘.
 
@@ -176,7 +164,7 @@ final_title_prompt = ChatPromptTemplate.from_template(
 )
 final_title_chain = final_title_prompt | llm_title | StrOutputParser()
 
-# 2-6. 대화 기록 관리 기능과 RAG 체인 최종 결합
+# [2-6] 대화 기록 관리 기능과 RAG 체인 최종 결합
 chain_with_history = RunnableWithMessageHistory(
     conversational_rag_chain,
     lambda session_id: get_session_data(session_id)["history"],
@@ -186,8 +174,7 @@ chain_with_history = RunnableWithMessageHistory(
 )
 
 
-# --- 3. FastAPI 애플리케이션 정의 ---
-
+# ---[3] FastAPI 애플리케이션 정의---
 app = FastAPI(title="Card Recommendation Chatbot")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -195,7 +182,10 @@ class ChatEndpointRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
 
-# JSON 응답 + 즉시 제목 생성을 처리하는 엔드포인트
+
+# ---[4] JSON 응답 함수---
+
+# [4-1] /chat : Cardly 카드 추천 AI 챗봇 URL
 @app.post("/chat")
 async def chat_endpoint(req: ChatEndpointRequest):
     session_id = req.session_id or str(uuid.uuid4())
@@ -203,44 +193,37 @@ async def chat_endpoint(req: ChatEndpointRequest):
     
     config = {"configurable": {"session_id": session_id}}
 
-    # 메인 RAG 체인 실행하여 답변 받기
+    # [4-1-A] 메인 RAG 체인 실행하여 답변 받기
     result = await chain_with_history.ainvoke({"input": req.message}, config=config)
     final_answer = result.get("answer", "오류: 답변을 생성하지 못했습니다.")
     
-    # --- title 및 card_list 생성 로직 ---
-    card_list = [] # 기본값은 빈 리스트
-    # "- Cardly Recommending:[...]" 패턴을 찾기 위한 정규표현식
+    # [4-1-B] card_list 생성 로직
+    card_list = []
     match = re.search(r"- Cardly Recommending:\s\[(.*?)\]", final_answer)
 
     if match:
-        # 대괄호 안의 내용(그룹 1)을 추출합니다. ex: "'카드A', '카드B'"
         cards_string = match.group(1)
-        if cards_string: # 괄호 안이 비어있지 않은 경우
-            # 쉼표로 분리하고, 각 항목의 양쪽 공백과 따옴표를 제거합니다.
+        if cards_string:
             card_list = [
                 card.strip().strip("'\"") for card in cards_string.split(',') if card.strip()
             ]
-
-    # [추가 개선] 최종 답변에서 Cardly Recommending 라인 제거
     cleaned_reply = re.sub(r"- Cardly Recommending: .*", "", final_answer).strip()    
 
-    # title 생성 또는 조회 (기존과 동일)
+    # [4-1-C] title 생성 또는 조회
     session_data = get_session_data(session_id)
     title = session_data.get("title")
-
     print(f"[{session_id}] 대화 시작, 제목을 생성합니다...")
-    # 1단계: 사용자의 첫 질문(req.message)에서 핵심 토픽 추출
+
     topic = await topic_extraction_chain.ainvoke({"user_question": req.message})
     print(f"[{session_id}] 추출된 토픽: {topic}")
     
-    # 2단계: 추출된 토픽으로 최종 제목 생성
     new_title = await final_title_chain.ainvoke({"topic": topic})
     
-    # 생성된 제목을 세션 데이터에 저장
     session_data["title"] = new_title
     title = new_title
     print(f"[{session_id}] 생성된 제목: {title}")
 
+    # [4-1-D] 최종 답변 출력
     print("--------------------------------------------------------")
     print(f"[최종 답변] {final_answer}")
 
@@ -251,10 +234,13 @@ async def chat_endpoint(req: ChatEndpointRequest):
         "card_list": card_list,
     }
 
+# [4-2] / : Cardly backend 상태 체크 URL
 @app.get("/")
 async def health_check():
     return {"status": "ok"}
 
+
+# ---[5] 로컬 테스트---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
