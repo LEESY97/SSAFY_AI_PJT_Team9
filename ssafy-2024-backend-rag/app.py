@@ -27,8 +27,8 @@ load_dotenv()
 
 # --- 1. 전역 객체 및 기록 저장소 설정 ---
 
-# 1-1. llm, embeddings 세팅
-llm = ChatUpstage(temperature=0)
+# 1-1. llm_rag, embeddings 세팅
+llm_rag = ChatUpstage(temperature=0)
 embeddings = UpstageEmbeddings(model="solar-embedding-1-large")
 
 # 1-2. Pinecone 클라이언트 및 인덱스 초기화
@@ -78,7 +78,7 @@ def get_session_data(session_id: str) -> dict:
 # 2-1. History-Aware Retriever 구성
 contextualize_q_system_prompt = """Given a chat history and the latest user question which might reference context in the chat history, formulate a standalone question which can be understood without the chat history. Do NOT answer the question, just reformulate it if needed and otherwise return it as is."""
 contextualize_q_prompt = ChatPromptTemplate.from_messages([("system", contextualize_q_system_prompt), MessagesPlaceholder("chat_history"), ("human", "{input}")])
-history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_q_prompt)
+history_aware_retriever = create_history_aware_retriever(llm_rag, retriever, contextualize_q_prompt)
 
 # 2-2. 최종 답변 생성을 위한 프롬프트 (기존 프롬프트 사용)
 qa_system_prompt = """
@@ -139,7 +139,7 @@ def format_docs_and_build_context(docs: List[Document]) -> str:
     return "\n\n".join(f"=== {card_name} ===\n{card_data}" for card_name, card_data in card_contexts.items())
 
 # 2-4. 최종적인 문서 생성 및 답변 체인 
-final_answer_chain = qa_prompt | llm | StrOutputParser()
+final_answer_chain = qa_prompt | llm_rag | StrOutputParser()
 
 conversational_rag_chain_produces_string = (
     RunnablePassthrough.assign(
@@ -153,11 +153,28 @@ conversational_rag_chain = RunnablePassthrough.assign(
 )
 
 # 2-5. 대화 내용 요약(제목 생성)을 위한 별도의 체인
-title_prompt = ChatPromptTemplate.from_messages([
-    ("system", "다음 대화 내용을 바탕으로, 전체 대화의 핵심 주제를 5~10단어 이내의 간결한 한글 제목으로 요약해줘. 사용자의 가장 핵심적인 질문이나 요구사항을 담아내. 예를 들어 '스타벅스 할인 카드 추천' 처럼 요약해줘."),
-    MessagesPlaceholder("chat_history"),
-])
-title_chain = title_prompt | llm | StrOutputParser()
+llm_title = ChatUpstage(temperature=0.3)
+topic_extraction_prompt = ChatPromptTemplate.from_template(
+    """다음 사용자 질문에서 가장 핵심적인 요구사항이나 키워드를 명사형으로 추출해줘. 
+    예를 들어 "스타벅스에서 할인 많이 되는 카드 찾아줘" 라는 질문의 핵심은 "스타벅스 할인" 이야. 
+    다른 설명 없이 핵심 키워드만 답해.
+
+    사용자 질문: {user_question}"""
+)
+topic_extraction_chain = topic_extraction_prompt | llm_title | StrOutputParser()
+
+# [핵심 수정] 2-B. 제목 생성을 위한 2단계: '최종 제목' 생성 체인
+final_title_prompt = ChatPromptTemplate.from_template(
+    """다음 키워드를 바탕으로, 대화방의 간결한 제목을 'OOO 카드 추천' 또는 'OOO 문의'와 같은 형태로 하나만 만들어줘.
+
+    출력 형태:
+    ex1) 커피 국민 카드 추천
+    ex2) 커피 국민 카드 문의
+    ex3) 다양한 혜택이 있는 카드 추천
+
+    키워드: {topic}"""
+)
+final_title_chain = final_title_prompt | llm_title | StrOutputParser()
 
 # 2-6. 대화 기록 관리 기능과 RAG 체인 최종 결합
 chain_with_history = RunnableWithMessageHistory(
@@ -181,7 +198,6 @@ class ChatEndpointRequest(BaseModel):
 # JSON 응답 + 즉시 제목 생성을 처리하는 엔드포인트
 @app.post("/chat")
 async def chat_endpoint(req: ChatEndpointRequest):
-    is_new_conversation = not req.session_id
     session_id = req.session_id or str(uuid.uuid4())
     print(f"[요청] session_id: {session_id}, message: {req.message}")
     
@@ -195,7 +211,6 @@ async def chat_endpoint(req: ChatEndpointRequest):
     card_list = [] # 기본값은 빈 리스트
     # "- Cardly Recommending:[...]" 패턴을 찾기 위한 정규표현식
     match = re.search(r"- Cardly Recommending:\s\[(.*?)\]", final_answer)
-    print(match)
 
     if match:
         # 대괄호 안의 내용(그룹 1)을 추출합니다. ex: "'카드A', '카드B'"
@@ -214,12 +229,19 @@ async def chat_endpoint(req: ChatEndpointRequest):
     title = session_data.get("title")
 
     print(f"[{session_id}] 대화 시작, 제목을 생성합니다...")
-    new_title = await title_chain.ainvoke({"chat_history": session_data["history"].messages})
+    # 1단계: 사용자의 첫 질문(req.message)에서 핵심 토픽 추출
+    topic = await topic_extraction_chain.ainvoke({"user_question": req.message})
+    print(f"[{session_id}] 추출된 토픽: {topic}")
+    
+    # 2단계: 추출된 토픽으로 최종 제목 생성
+    new_title = await final_title_chain.ainvoke({"topic": topic})
+    
+    # 생성된 제목을 세션 데이터에 저장
     session_data["title"] = new_title
     title = new_title
     print(f"[{session_id}] 생성된 제목: {title}")
-    print(title)
 
+    print("--------------------------------------------------------")
     print(f"[최종 답변] {final_answer}")
 
     return {
