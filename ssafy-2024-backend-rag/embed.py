@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter, CharacterTextSplitter
 from langchain_pinecone import PineconeVectorStore
@@ -159,11 +160,12 @@ database = PineconeVectorStore.from_documents(
 )
 
 # Upload documents in batches
-batch_size = 100
+batch_size = 20
 print(f'total batch:{len(all_documents)}, batch size:{batch_size}')
 for i in range(0, len(all_documents), batch_size):
     print(f'index: {i}, batch size: {batch_size}')
     batch = all_documents[i:i + batch_size]
     database.add_documents(batch)  # Add documents to the existing database
+    time.sleep(2)
 
 print("end")
