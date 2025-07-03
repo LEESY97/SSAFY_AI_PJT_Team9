@@ -133,23 +133,30 @@ class ChatEndpointRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
 
-# [수정 확인] 스트리밍 제너레이터 함수
-async def stream_generator(query: str, session_id: str):
-    # [수정 확인] config에 'session_id' 전달
-    config = {"configurable": {"session_id": session_id}}
-    async for chunk in chain_with_history.astream({"input": query}, config=config):
-        if "answer" in chunk:
-            yield chunk["answer"]
-
-# [수정 확인] FastAPI 엔드포인트
+# [수정] JSON 응답을 반환하는 FastAPI 엔드포인트
 @app.post("/chat")
 async def chat_endpoint(req: ChatEndpointRequest):
+    # session_id가 없으면 새로 생성 (대화 기록 관리를 위해 유지)
     session_id = req.session_id or str(uuid.uuid4())
     print(f"[요청] session_id: {session_id}, message: {req.message}")
     
-    response = StreamingResponse(stream_generator(req.message, session_id), media_type="text/event-stream")
-    response.headers["X-Session-ID"] = session_id
-    return response
+    # LangChain에 전달할 config 설정
+    config = {"configurable": {"session_id": session_id}}
+
+    # .ainvoke()를 사용하여 전체 답변이 생성될 때까지 기다렸다가 결과를 받음
+    result = await chain_with_history.ainvoke(
+        {"input": req.message}, 
+        config=config
+    )
+
+    # 체인 실행 결과에서 'answer' 키의 값을 추출
+    final_answer = result.get("answer", "오류: 답변을 생성하지 못했습니다.")
+    
+    print(f"[최종 답변] {final_answer}")
+
+    # 최종 답변과 session_id를 JSON 형식으로 반환
+    return {"reply": final_answer, "session_id": session_id}
+
 
 @app.get("/")
 async def health_check():
