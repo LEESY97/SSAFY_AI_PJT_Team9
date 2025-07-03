@@ -20,7 +20,7 @@ with open("all_cards.txt", encoding="utf-8") as f:
 card_blocks = re.split(r"(?=\[카드 이름\])", raw_text)
 card_blocks = [block.strip() for block in card_blocks if block.strip()]
 
-# [2-1] 메타데이터 크기 사전 체크
+# [2-1] 메타데이터 크기 사전 체크 (Pinecone 제한)
 for block in card_blocks:
     name_match = re.search(r"\[카드 이름\]\s*(.*)", block)
     corp_match = re.search(r"\[카드사\]\s*(.*)", block)
@@ -56,80 +56,69 @@ def create_card_documents(card_block):
     card_name = name_match.group(1).strip() if name_match else "Unknown"
     card_corp = corp_match.group(1).strip() if corp_match else "Unknown"
 
-    sub_chunks = re.split(r"(?=Option \d+\.)", card_block)
-    if len(sub_chunks) == 1:
-        splitter = CharacterTextSplitter(
-            separator="\n\n",
-            chunk_size=1500,
-            chunk_overlap=0
-        )
-        sub_chunks = splitter.split_text(card_block)
-
     documents = []
-    for sub in sub_chunks:
-        sub = sub.strip()
-        if not sub:
-            continue
+    token_len = len(tokenizer.encode(card_block))
 
-        token_len = len(tokenizer.encode(sub))
-        if token_len <= 4000:
-            documents.append(
-                Document(
-                    page_content=sub,
-                    metadata={
-                        "card_name": card_name,
-                        "card_corp": card_corp,
-                        "card_full_data": card_block
-                    }
-                )
+    if token_len <= 4000:
+        documents.append(
+            Document(
+                page_content=card_block,
+                metadata={
+                    "card_name": card_name,
+                    "card_corp": card_corp,
+                    "card_full_data": card_block
+                }
             )
-        else:
-            print(f"⚠️ 매우 큰 조각 감지, token 수: {token_len}, 카드: {card_name}")
+        )
+    else:
+        print(f"⚠️ 매우 큰 카드 데이터 감지, token 수: {token_len}, 카드: {card_name}")
 
-            splitter = RecursiveCharacterTextSplitter(
-                separators=["\n\n", "\n", ".", " ", ""],
-                chunk_size=3000,
-                chunk_overlap=100
-            )
-            smaller_chunks = splitter.split_text(sub)
-            for small in smaller_chunks:
-                small = small.strip()
-                if not small:
-                    continue
-                small_token_len = len(tokenizer.encode(small))
-                if small_token_len > 4000:
-                    print(f"⚠️ 매우 큰 조각 감지, token 수: {small_token_len}, 카드: {card_name}")
-                    hard_chunks = hard_split_by_tokens(small, 3000)
-                    for idx, hard in enumerate(hard_chunks):
-                        hard = hard.strip()
-                        if not hard:
-                            continue
-                        hard_token_len = len(tokenizer.encode(hard))
-                        if hard_token_len > 4000:
-                            print(f"⚠️ [오류] 강제 분할 후에도 4000 초과, token 수: {hard_token_len}, 카드: {card_name}")
-                        else:
-                            print(f"✅ 강제 분할 조각 {idx+1}/{len(hard_chunks)}, token 수: {hard_token_len}, 카드: {card_name}")
-                            documents.append(
-                                Document(
-                                    page_content=hard,
-                                    metadata={
-                                        "card_name": card_name,
-                                        "card_corp": card_corp,
-                                        "card_full_data": card_block
-                                    }
-                                )
+        splitter = RecursiveCharacterTextSplitter(
+            separators=["\n\n", "\n", ".", " ", ""],
+            chunk_size=3000,
+            chunk_overlap=100
+        )
+        smaller_chunks = splitter.split_text(card_block)
+
+        for small in smaller_chunks:
+            small = small.strip()
+            if not small:
+                continue
+            small_token_len = len(tokenizer.encode(small))
+
+            if small_token_len > 4000:
+                #print(f"⚠️ 매우 큰 조각 감지, token 수: {small_token_len}, 카드: {card_name}")
+                hard_chunks = hard_split_by_tokens(small, 3000)
+                for idx, hard in enumerate(hard_chunks):
+                    hard = hard.strip()
+                    if not hard:
+                        continue
+                    hard_token_len = len(tokenizer.encode(hard))
+                    if hard_token_len > 4000:
+                        print(f"⚠️ [오류] 강제 분할 후에도 4000 초과, token 수: {hard_token_len}, 카드: {card_name}")
+                    else:
+                        #print(f"✅ 강제 분할 조각 {idx+1}/{len(hard_chunks)}, token 수: {hard_token_len}, 카드: {card_name}")
+                        documents.append(
+                            Document(
+                                page_content=hard,
+                                metadata={
+                                    "card_name": card_name,
+                                    "card_corp": card_corp,
+                                    "card_full_data": card_block
+                                }
                             )
-                else:
-                    documents.append(
-                        Document(
-                            page_content=small,
-                            metadata={
-                                "card_name": card_name,
-                                "card_corp": card_corp,
-                                "card_full_data": card_block
-                            }
                         )
+            else:
+                documents.append(
+                    Document(
+                        page_content=small,
+                        metadata={
+                            "card_name": card_name,
+                            "card_corp": card_corp,
+                            "card_full_data": card_block
+                        }
                     )
+                )
     return documents
 
 # [6] Document 리스트 생성
@@ -159,13 +148,13 @@ database = PineconeVectorStore.from_documents(
     index_name=index_name,
 )
 
-# Upload documents in batches
+# API 호출 횟수 제한으로 batch_size로 분리 후 임베딩
 batch_size = 20
 print(f'total batch:{len(all_documents)}, batch size:{batch_size}')
 for i in range(0, len(all_documents), batch_size):
     print(f'index: {i}, batch size: {batch_size}')
     batch = all_documents[i:i + batch_size]
-    database.add_documents(batch)  # Add documents to the existing database
+    database.add_documents(batch)  
     time.sleep(2)
 
 print("end")
