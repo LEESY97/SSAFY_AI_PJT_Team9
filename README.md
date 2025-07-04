@@ -41,6 +41,8 @@
 **2.2. 실시간 추론 API (`app.py`)**
 이 스크립트는 사용자의 요청을 받아 대화형 RAG 체인을 실행하고, 최종 결과를 반환하는 FastAPI 서버입니다.
 
+![backend_app_flowchart.png](./backend_app_flowchart.png)
+
 **전역 객체 및 체인 구성**
 - 서버 시작 시, LLM, Retriever, RAG 체인 등 무거운 객체들을 **전역적으로 한 번만 초기화**하여 매 요청마다 발생하는 지연을 최소화합니다.
 
