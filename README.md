@@ -16,6 +16,8 @@
 **2.1. 데이터 임베딩 파이프라인 (`embed.py`)**
 이 스크립트는 비정형 텍스트 데이터를 RAG 시스템이 활용할 수 있는 벡터 데이터로 변환하여 Pinecone에 저장하는 역할을 합니다.
 
+![backend_embed.png](./backend_embed.png)
+
 1. 데이터 로드 및 분할:
 
     - `all_cards.txt` 파일을 읽어 `[카드 이름]` 패턴을 기준으로 각 카드별 정보(`card_blocks`)를 분리합니다.
