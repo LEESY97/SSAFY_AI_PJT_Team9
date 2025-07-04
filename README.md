@@ -100,7 +100,7 @@ python -m venv venv
 pip install -r requirements.txt
 
 # 3. .env 파일 생성 및 API 키 입력
-# UPSTAGE_API_KEY="sk-..."
+# UPSTAGE_API_KEY="up_..."
 # PINECONE_API_KEY="..."
 ```
 
